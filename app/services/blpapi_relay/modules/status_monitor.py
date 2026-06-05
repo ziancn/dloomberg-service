@@ -6,6 +6,7 @@ import blpapi
 import logging
 
 from .protocol import ModuleProtocol
+from app.readiness import Readiness
 
 
 # Configure logger for this module
@@ -36,8 +37,11 @@ class StatusMonitor(ModuleProtocol):
     """
     Logging module
     """
-    def __init__(self):
-        ...
+    def __init__(
+            self,
+            readiness: Readiness | None = None
+    ):
+        self.readiness = readiness
 
 
     def process_event(
@@ -56,12 +60,22 @@ class StatusMonitor(ModuleProtocol):
     def process_session_status_event(self, event: blpapi.Event, session: blpapi.Session):
         for msg in event:
             match msg.messageType():
-                case SessionMsg.SESSION_STARTED         : logger.info(f"Session started...")
-                case SessionMsg.SESSION_STARTUP_FAILURE : logger.error(f"Session startup failed")
-                case SessionMsg.SESSION_CONNECTION_UP   : logger.info(f"Session connection is up")
-                case SessionMsg.SESSION_CONNECTION_DOWN : logger.info(f"Session connection is down")
-                case SessionMsg.SESSION_TERMINATED      : logger.info(f"Session terminated")
-                case _: logger.info(f"{msg}")
+                case SessionMsg.SESSION_STARTED:
+                    logger.info(f"Session started...")
+                case SessionMsg.SESSION_STARTUP_FAILURE:
+                    logger.error(f"Session startup failed")
+                    if self.readiness: self.readiness.blpapi = False
+                case SessionMsg.SESSION_CONNECTION_UP:
+                    logger.info(f"Session connection is up")
+                    if self.readiness: self.readiness.blpapi = True
+                case SessionMsg.SESSION_CONNECTION_DOWN:
+                    logger.info(f"Session connection is down")
+                    if self.readiness: self.readiness.blpapi = False
+                case SessionMsg.SESSION_TERMINATED:
+                    logger.info(f"Session terminated")
+                    if self.readiness: self.readiness.blpapi = False
+                case _:
+                    logger.info(f"{msg}")
 
 
     def process_service_status_event(self, event: blpapi.Event, session: blpapi.Session):

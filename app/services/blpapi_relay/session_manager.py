@@ -68,13 +68,11 @@ class SessionManager:
 
 
     def start(self):
-        if not self._session.start():
-            raise RuntimeError("Failed to start EMSX session")
+        return self._session.start()
 
 
     def start_async(self):
-        if not self._session.startAsync():
-            raise RuntimeError("Failed to start(async) EMSX session")
+        return self._session.startAsync()
 
 
     def stop(self):
