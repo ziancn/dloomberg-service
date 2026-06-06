@@ -6,7 +6,6 @@ import asyncio
 import aiohttp
 import html
 import re
-import json
 
 from app.config import settings
 
@@ -54,7 +53,6 @@ def parse_summary(text):
    etp_pct_pattern = re.compile(r'Short Selling of Designated Securities \(ETP only\) as % total turnover\s*:\s*(?P<pct>\d+)%')
    all_pct_pattern = re.compile(r'Short Selling of all Designated Securities as % total turnover\s*:\s*(?P<pct>\d+)%')
 
-
    market_match = mkt_turnover_pattern.search(text)
    non_etp_match = non_etp_pct_pattern.search(text)
    etp_match = etp_pct_pattern.search(text)
@@ -96,7 +94,6 @@ async def main(urls) -> list[dict]:
        return await asyncio.gather(*tasks)
 
 
-
 urls = [
    "https://www.hkex.com.hk/eng/stat/smstat/ssturnover/ncms/mshtmain.htm",  # Mainboard by AM
    "https://www.hkex.com.hk/eng/stat/smstat/ssturnover/ncms/mshtgem.htm",   # GEM by AM
@@ -106,5 +103,47 @@ urls = [
 
 
 async def get_hkss_data():
-   result = await main(urls)
-   return result
+    results = await main(urls)
+    
+    am_rows = []
+    pm_rows = []
+    
+    boards = ["Main", "GEM", "Main", "GEM"]
+    is_pm_list = [False, False, True, True]
+    
+    am_summary = {"Main": None, "GEM": None}
+    pm_summary = {"Main": None, "GEM": None}
+    
+    for r, board, is_pm in zip(results, boards, is_pm_list):
+        parsed = r["parsed"]
+        
+        if is_pm:
+            pm_summary[board] = parsed["summary"]
+        else:
+            am_summary[board] = parsed["summary"]
+        
+        for row in parsed["rows"]:
+            row["board"] = board
+            if is_pm:
+                pm_rows.append(row)
+            else:
+                am_rows.append(row)
+    
+    return [
+        {
+            "session": "AM",
+            "rows": am_rows,
+            "summary": {
+                "Main": am_summary["Main"],
+                "GEM": am_summary["GEM"]
+            }
+        },
+        {
+            "session": "PM",
+            "rows": pm_rows,
+            "summary": {
+                "Main": pm_summary["Main"],
+                "GEM": pm_summary["GEM"]
+            }
+        }
+    ]
