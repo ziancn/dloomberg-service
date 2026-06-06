@@ -1,4 +1,5 @@
 import uvicorn
+import logging
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from contextlib import asynccontextmanager
@@ -15,7 +16,16 @@ from .readiness import Readiness
 from .services.blpapi_relay.session_manager import SessionManager
 from .services.blpapi_relay.modules.refdata_handler import RefDataHandler
 from .services.blpapi_relay.modules.status_monitor import StatusMonitor
+from .services.blpapi_relay.modules.mktdata_handler import MktDataHandler
 
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+
+logger = logging.getLogger(__name__)
 
 
 @asynccontextmanager
@@ -30,14 +40,30 @@ async def lifespan(app: FastAPI):
     status_monitor = StatusMonitor(readiness)
     sm.register_module(status_monitor)
 
+    mktdata_handler = MktDataHandler()
+    sm.register_module(mktdata_handler)
 
-    # -- --
+
+    # -- Binding --
     app.state.readiness = readiness
     app.state.blp_session_manager = sm
+    app.state.refdata_handler = refdata_handler
+    app.state.mktdata_handler = mktdata_handler
 
+    # -- Create a blpapi session and send an async start request --
+    while True:
+        if sm.start_async():
+            break
+
+    
+    logger.info("Start up looks good now")
+    
     yield
+
+
     # == Shut down ==
-    print("Shutting down the application...")
+    logger.info("Shutting down the application...")
+    sm.stop()
 
 
 # Initialize with lifespan and configuration
