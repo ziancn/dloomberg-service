@@ -10,6 +10,7 @@ from .routers import (
     status,
     hkex,
     blp,
+    sfc,
 )
 
 from .readiness import Readiness
@@ -55,9 +56,7 @@ async def lifespan(app: FastAPI):
         if sm.start_async():
             break
 
-    
-    logger.info("Start up looks good now")
-    
+
     yield
 
 
@@ -85,6 +84,7 @@ app.include_router(root.router)
 app.include_router(status.router)
 app.include_router(hkex.router)
 app.include_router(blp.router)
+app.include_router(sfc.router)
 
 
 if __name__ == "__main__":
