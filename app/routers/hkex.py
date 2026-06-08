@@ -16,4 +16,4 @@ router = APIRouter(
 @router.get("/short-sell-turnover")
 async def get_short_sell_turnover():
     data = await get_hkss_data()
-    return {"data": data}
+    return data
