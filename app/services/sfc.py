@@ -11,6 +11,40 @@ logger = logging.getLogger(__name__)
 LicStatus = Literal["active", "all"]
 SearchBy = Literal["individual", "corporation", "ceref"]
 
+# All 10 SFC licence types with descriptions
+ALL_LICENCE_TYPES: list[dict] = [
+    {"actType": 1, "actDesc": "Dealing in Securities", "cactDesc": "證券交易"},
+    {"actType": 2, "actDesc": "Dealing in Futures Contracts", "cactDesc": "期貨合約交易"},
+    {"actType": 3, "actDesc": "Leveraged Foreign Exchange Trading", "cactDesc": "槓桿式外匯交易"},
+    {"actType": 4, "actDesc": "Advising on Securities", "cactDesc": "就證券提供意見"},
+    {"actType": 5, "actDesc": "Advising on Futures Contracts", "cactDesc": "就期貨合約提供意見"},
+    {"actType": 6, "actDesc": "Advising on Corporate Finance", "cactDesc": "就機構融資提供意見"},
+    {"actType": 7, "actDesc": "Providing Automated Trading Services", "cactDesc": "提供自動化交易服務"},
+    {"actType": 8, "actDesc": "Securities Margin Financing", "cactDesc": "證券保證金融資"},
+    {"actType": 9, "actDesc": "Asset Management", "cactDesc": "資產管理"},
+    {"actType": 10, "actDesc": "Providing Credit Rating Services", "cactDesc": "提供信貸評級服務"},
+]
+
+
+def _normalize_licences(items: list[dict]) -> list[dict]:
+    """
+    Expand raDetails for each item to include all 10 licence types,
+    adding a hasLicence boolean indicating whether the licensee holds it.
+    """
+    for item in items:
+        existing_types: set[int] = {
+            detail["actType"] for detail in item.get("raDetails", [])
+        }
+        item["raDetails"] = [
+            {
+                **licence_def,
+                "hasLicence": licence_def["actType"] in existing_types,
+            }
+            for licence_def in ALL_LICENCE_TYPES
+        ]
+        # Also handle raDetailsAmlo if needed (keep as-is for now)
+    return items
+
 
 def search_licensee(
     keyword: str,
@@ -111,7 +145,7 @@ def search_licensee(
         logger.info(f"Page 1 returned {len(all_items)} items. API totalCount: {total_count}")
 
         if total_count == 0 or not all_items:
-            return {"totalCount": total_count, "items": all_items}
+            return {"totalCount": total_count, "items": _normalize_licences(all_items)}
     except Exception as e:
         logger.error(f"Page 1 request error: {e}")
         return {"totalCount": 0, "items": []}
@@ -120,7 +154,7 @@ def search_licensee(
     total_pages = (total_count + page_limit - 1) // page_limit
     if total_pages <= 1:
         logger.info("All data fetched (only 1 page).")
-        return {"totalCount": total_count, "items": all_items}
+        return {"totalCount": total_count, "items": _normalize_licences(all_items)}
 
     remaining_pages = list(range(2, total_pages + 1))
     logger.info(f"Total pages: {total_pages}, fetching remaining {len(remaining_pages)} pages concurrently...")
@@ -165,13 +199,13 @@ def search_licensee(
             all_items.extend(pages_results[page_num])
 
     logger.info(f"All data fetched. Total: {len(all_items)} items.")
-    return {"totalCount": total_count, "items": all_items}
+    return {"totalCount": total_count, "items": _normalize_licences(all_items)}
 
 
 # --- Test ---
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(levelname)s: %(message)s")
-    test_keyword = "Sze Man"
+    test_keyword = "chen zian"
     results = search_licensee(test_keyword, licstatus="active", searchby="individual")
     print(f"totalCount={results['totalCount']}, actual_items={len(results['items'])}")
     print(json.dumps(results, ensure_ascii=False, indent=2))
