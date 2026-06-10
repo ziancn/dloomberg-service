@@ -1,8 +1,10 @@
 import json
 import logging
+import re
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Literal
+from datetime import datetime
+from typing import Any, Literal
 
 import requests
 
@@ -25,24 +27,184 @@ ALL_LICENCE_TYPES: list[dict] = [
     {"actType": 10, "actDesc": "Providing Credit Rating Services", "cactDesc": "提供信貸評級服務"},
 ]
 
+# ---------------------------------------------------------------------------
+# Shared HTTP helpers
+# ---------------------------------------------------------------------------
+
+DEFAULT_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+    "Connection": "keep-alive",
+}
+
+
+def _make_session() -> requests.Session:
+    session = requests.Session()
+    session.headers.update(DEFAULT_HEADERS)
+    return session
+
+
+# ---------------------------------------------------------------------------
+# HTML scraping helpers
+# ---------------------------------------------------------------------------
+
+# Pattern:  var varname = [{...}];
+_JS_VAR_RE = re.compile(
+    r"""var\s+(?P<varname>[A-Za-z_]\w*)\s*=\s*(?P<json>\[[\s\S]*?\])\s*;""",
+)
+
+# Pattern: "Mar 27, 2025 12:00:00 AM" (Java/ExtJS date format used by SFC)
+_SFC_DATE_RE = re.compile(
+    r"""^(?P<m>[A-Z][a-z]{2})\s+\d{1,2},\s+\d{4}\s+\d{1,2}:\d{2}:\d{2}\s+[AP]M$"""
+)
+_SFC_DATE_FMT = "%b %d, %Y %I:%M:%S %p"
+
+
+def _normalize_dates(obj: Any) -> Any:
+    """Recursively walk a JSON-like structure and convert SFC date strings
+    (e.g. ``"Mar 27, 2025 12:00:00 AM"``) to ``"YYYY-MM-DD"``.
+    """
+    if isinstance(obj, dict):
+        return {k: _normalize_dates(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_normalize_dates(v) for v in obj]
+    if isinstance(obj, str) and _SFC_DATE_RE.match(obj):
+        try:
+            return datetime.strptime(obj, _SFC_DATE_FMT).strftime("%Y-%m-%d")
+        except ValueError:
+            return obj
+    return obj
+
+
+def _extract_js_vars(html: str) -> dict[str, list[dict]]:
+    """Extract all *top-level-array* JavaScript var assignments from HTML.
+
+    Returns a dict mapping variable name → parsed JSON list.
+    """
+    result: dict[str, list[dict]] = {}
+    for m in _JS_VAR_RE.finditer(html):
+        name = m.group("varname")
+        raw = m.group("json")
+        try:
+            result[name] = json.loads(raw)
+        except json.JSONDecodeError:
+            logger.warning("Failed to parse JSON for JS var %r", name)
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Page-specific parsers
+# ---------------------------------------------------------------------------
+
+def _parse_details_page(html: str) -> dict[str, Any]:
+    """Parse the /indi/{ceref}/details HTML."""
+    all_vars = _extract_js_vars(html)
+    return {
+        "sfoLicences": all_vars.get("indData", []),
+        "amloLicences": all_vars.get("amloindData", []),
+    }
+
+
+def _parse_licence_record_page(html: str) -> dict[str, Any]:
+    """Parse the /indi/{ceref}/licenceRecord HTML."""
+    all_vars = _extract_js_vars(html)
+    return {
+        "sfoRecords": all_vars.get("licRecordData", []),
+        "amloRecords": all_vars.get("amlolicRecordData", []),
+    }
+
+
+# ---------------------------------------------------------------------------
+# High-level: fetch + parse multiple pages concurrently
+# ---------------------------------------------------------------------------
+
+# Page definitions – add new pages here as needed.
+# Key = logical name, value = URL path segment after ceref.
+_INDIVIDUAL_PAGES: dict[str, str] = {
+    "details": "details",
+    "licenceRecord": "licenceRecord",
+    # future: "addresses": "addresses",
+    # future: "conditions": "conditions",
+    # future: "disciplinaryAction": "disciplinaryAction",
+}
+
+
+def _fetch_page(
+    session: requests.Session,
+    ceref: str,
+    page_path: str,
+    *,
+    timeout: int = 30,
+) -> str | None:
+    """Fetch a single HTML page; return *html* or *None* on failure."""
+    url = f"https://apps.sfc.hk/publicregWeb/indi/{ceref}/{page_path}"
+    try:
+        resp = session.get(url, timeout=timeout)
+        if resp.status_code == 200:
+            return resp.text
+        logger.warning("Non-200 (%d) for %s", resp.status_code, url)
+        return None
+    except Exception:
+        logger.exception("Request failed for %s", url)
+        return None
+
+
+def search_indi_details(ceref: str) -> dict[str, Any]:
+    """Fetch all individual details sub-pages and return parsed table data.
+
+    Currently fetches:
+        - /indi/{ceref}/details       → sfoLicences, amloLicences
+        - /indi/{ceref}/licenceRecord → sfoRecords, amloRecords
+
+    Returns a dict keyed by logical page name + parsed fields.
+    """
+    session = _make_session()
+
+    # Fetch all pages concurrently
+    html_results: dict[str, str | None] = {}
+    max_workers = min(len(_INDIVIDUAL_PAGES), 5)
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_map = {
+            executor.submit(_fetch_page, session, ceref, path): name
+            for name, path in _INDIVIDUAL_PAGES.items()
+        }
+        for future in as_completed(future_map):
+            name = future_map[future]
+            html_results[name] = future.result()
+
+    # Parse
+    result: dict[str, Any] = {"ceref": ceref}
+
+    details_html = html_results.get("details")
+    if details_html:
+        result.update(_parse_details_page(details_html))
+
+    lr_html = html_results.get("licenceRecord")
+    if lr_html:
+        result.update(_parse_licence_record_page(lr_html))
+
+    # Normalize all date strings to YYYY-MM-DD
+    return _normalize_dates(result)
+
+
+# ---------------------------------------------------------------------------
+# search_licensee (existing API-based search)
+# ---------------------------------------------------------------------------
 
 def _normalize_licences(items: list[dict]) -> list[dict]:
-    """
-    Expand raDetails for each item to include all 10 licence types,
-    adding a hasLicence boolean indicating whether the licensee holds it.
-    """
+    """Expand raDetails so every item shows all 10 licence types with hasLicence bool."""
     for item in items:
         existing_types: set[int] = {
             detail["actType"] for detail in item.get("raDetails", [])
         }
         item["raDetails"] = [
-            {
-                **licence_def,
-                "hasLicence": licence_def["actType"] in existing_types,
-            }
+            {**licence_def, "hasLicence": licence_def["actType"] in existing_types}
             for licence_def in ALL_LICENCE_TYPES
         ]
-        # Also handle raDetailsAmlo if needed (keep as-is for now)
     return items
 
 
@@ -51,51 +213,34 @@ def search_licensee(
     licstatus: LicStatus = "active",
     searchby: SearchBy = "individual",
 ) -> dict:
-    """
-    Fetch all SFC licensee data with concurrent pagination.
+    """Fetch SFC licensee list via the JSON API with concurrent pagination."""
+    session = _make_session()
 
-    Args:
-        keyword: Search keyword (name for individual/corporation, ceref for ceref search)
-        licstatus: "active" or "all"
-        searchby: "individual", "corporation", or "ceref"
-
-    Returns:
-        {"totalCount": N, "items": [...]}
-    """
-    session = requests.Session()
-    session.headers.update({
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-        'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
-        'Connection': 'keep-alive',
-    })
-
-    # 1. Initialize session by visiting homepage to get fresh cookies
+    # 1. Warm up session cookies
     index_url = "https://apps.sfc.hk/publicregWeb/searchByName?locale=en"
     try:
         init_res = session.get(index_url, timeout=15)
         if init_res.status_code != 200:
-            logger.error(f"Session init failed, status: {init_res.status_code}")
+            logger.error("Session init failed, status: %s", init_res.status_code)
             return {"totalCount": 0, "items": []}
-    except Exception as e:
-        logger.error(f"Session init error: {e}")
+    except Exception:
+        logger.exception("Session init error")
         return {"totalCount": 0, "items": []}
 
     time.sleep(1)
 
-    # 2. Prepare common parameters
     api_url = "https://apps.sfc.hk/publicregWeb/searchByNameJson"
     page_limit = 20
 
     api_headers = {
-        'Accept': 'application/json, text/javascript, */*; q=0.01',
-        'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
-        'Origin': 'https://apps.sfc.hk',
-        'Referer': index_url,
-        'X-Requested-With': 'XMLHttpRequest'
+        "Accept": "application/json, text/javascript, */*; q=0.01",
+        "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
+        "Origin": "https://apps.sfc.hk",
+        "Referer": index_url,
+        "X-Requested-With": "XMLHttpRequest",
     }
 
-    # Determine searchbyoption and entityType from searchby
+    # Determine searchbyoption / entityType
     if searchby == "ceref":
         searchbyoption = "byceref"
         entity_type = None
@@ -106,106 +251,141 @@ def search_licensee(
         searchbyoption = "byname"
         entity_type = "corporation"
 
-    def build_form_data(page_num: int):
-        """Build form data for API request"""
+    def _build_form(page_num: int) -> dict:
         start = (page_num - 1) * page_limit
         data = {
-            'licstatus': licstatus,
-            'lictype': 'all',
-            'searchbyoption': searchbyoption,
-            'searchtext': keyword,
-            'page': str(page_num),
-            'start': str(start),
-            'limit': str(page_limit),
-            'sort': '[{"property":"ceref","direction":"ASC"}]',
+            "licstatus": licstatus,
+            "lictype": "all",
+            "searchbyoption": searchbyoption,
+            "searchtext": keyword,
+            "page": str(page_num),
+            "start": str(start),
+            "limit": str(page_limit),
+            "sort": '[{"property":"ceref","direction":"ASC"}]',
         }
         if entity_type:
-            data['entityType'] = entity_type
+            data["entityType"] = entity_type
         if searchbyoption == "byname":
-            data['searchlang'] = 'en'
+            data["searchlang"] = "en"
         return data
 
-    # 3. Request page 1 to get totalCount and first page data
-    logger.info(f"Fetching page 1 (keyword={keyword}, searchby={searchby}, licstatus={licstatus})...")
+    # 2. Page 1
+    logger.info(
+        "Fetching page 1 (keyword=%r, searchby=%s, licstatus=%s)...",
+        keyword,
+        searchby,
+        licstatus,
+    )
     try:
-        first_response = session.post(
+        first_resp = session.post(
             api_url,
-            params={'_dc': str(int(time.time() * 1000))},
+            params={"_dc": str(int(time.time() * 1000))},
             headers=api_headers,
-            data=build_form_data(1),
-            timeout=30
+            data=_build_form(1),
+            timeout=30,
         )
-        if first_response.status_code != 200:
-            logger.error(f"Page 1 request failed, status: {first_response.status_code}")
+        if first_resp.status_code != 200:
+            logger.error("Page 1 request failed, status: %s", first_resp.status_code)
             return {"totalCount": 0, "items": []}
 
-        first_json = first_response.json()
+        first_json = first_resp.json()
         total_count = first_json.get("totalCount", 0)
-        all_items = first_json.get("items", [])
-        logger.info(f"Page 1 returned {len(all_items)} items. API totalCount: {total_count}")
+        all_items: list[dict] = first_json.get("items", [])
+        logger.info("Page 1 returned %d items. API totalCount: %d", len(all_items), total_count)
 
         if total_count == 0 or not all_items:
             return {"totalCount": total_count, "items": _normalize_licences(all_items)}
-    except Exception as e:
-        logger.error(f"Page 1 request error: {e}")
+    except Exception:
+        logger.exception("Page 1 request error")
         return {"totalCount": 0, "items": []}
 
-    # 4. Calculate remaining pages
+    # 3. Remaining pages
     total_pages = (total_count + page_limit - 1) // page_limit
     if total_pages <= 1:
-        logger.info("All data fetched (only 1 page).")
         return {"totalCount": total_count, "items": _normalize_licences(all_items)}
 
-    remaining_pages = list(range(2, total_pages + 1))
-    logger.info(f"Total pages: {total_pages}, fetching remaining {len(remaining_pages)} pages concurrently...")
+    remaining = list(range(2, total_pages + 1))
+    logger.info("Total pages: %d, fetching %d more concurrently...", total_pages, len(remaining))
 
-    # 5. Concurrently fetch remaining pages
-    def fetch_page(page_num: int):
-        """Fetch a single page concurrently"""
+    def _fetch_one(page_num: int):
         try:
-            local_session = requests.Session()
-            local_session.cookies.update(session.cookies)
-            local_session.headers.update(session.headers)
-
-            resp = local_session.post(
+            s = requests.Session()
+            s.cookies.update(session.cookies)
+            s.headers.update(session.headers)
+            r = s.post(
                 api_url,
-                params={'_dc': str(int(time.time() * 1000))},
+                params={"_dc": str(int(time.time() * 1000))},
                 headers=api_headers,
-                data=build_form_data(page_num),
-                timeout=30
+                data=_build_form(page_num),
+                timeout=30,
             )
-            if resp.status_code == 200:
-                items = resp.json().get("items", [])
-                logger.info(f"Page {page_num} returned {len(items)} items.")
+            if r.status_code == 200:
+                items = r.json().get("items", [])
+                logger.info("Page %d returned %d items.", page_num, len(items))
                 return page_num, items
-            else:
-                logger.warning(f"Page {page_num} request failed, status: {resp.status_code}")
-                return page_num, []
-        except Exception as e:
-            logger.error(f"Page {page_num} request error: {e}")
+            logger.warning("Page %d request failed, status: %d", page_num, r.status_code)
+            return page_num, []
+        except Exception:
+            logger.exception("Page %d request error", page_num)
             return page_num, []
 
-    pages_results: dict[int, list] = {}
-    max_workers = min(len(remaining_pages), 5)
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        future_to_page = {executor.submit(fetch_page, p): p for p in remaining_pages}
-        for future in as_completed(future_to_page):
-            page_num, items = future.result()
-            pages_results[page_num] = items
+    pages_map: dict[int, list[dict]] = {}
+    max_w = min(len(remaining), 5)
+    with ThreadPoolExecutor(max_workers=max_w) as executor:
+        f2p = {executor.submit(_fetch_one, p): p for p in remaining}
+        for future in as_completed(f2p):
+            pn, items = future.result()
+            pages_map[pn] = items
 
-    # 6. Merge results in page order
-    for page_num in range(2, total_pages + 1):
-        if page_num in pages_results:
-            all_items.extend(pages_results[page_num])
+    for pn in range(2, total_pages + 1):
+        if pn in pages_map:
+            all_items.extend(pages_map[pn])
 
-    logger.info(f"All data fetched. Total: {len(all_items)} items.")
+    logger.info("All data fetched. Total: %d items.", len(all_items))
     return {"totalCount": total_count, "items": _normalize_licences(all_items)}
 
 
-# --- Test ---
+# ---------------------------------------------------------------------------
+# search_corp_details (placeholder)
+# ---------------------------------------------------------------------------
+
+def search_corp_details():
+    ...
+
+
+# ---------------------------------------------------------------------------
+# Quick manual test
+# ---------------------------------------------------------------------------
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(levelname)s: %(message)s")
-    test_keyword = "chen zian"
-    results = search_licensee(test_keyword, licstatus="active", searchby="individual")
-    print(f"totalCount={results['totalCount']}, actual_items={len(results['items'])}")
-    print(json.dumps(results, ensure_ascii=False, indent=2))
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
+    )
+
+    # --- Test 1: search_licensee (existing) ---
+    # print("=" * 60)
+    # print("Test: search_licensee")
+    # results = search_licensee("chen zian", licstatus="active", searchby="individual")
+    # print(f"  totalCount={results['totalCount']}, actual_items={len(results['items'])}")
+    # if results["items"]:
+    #     first = results["items"][0]
+    #     print(f"  First result: {first.get('cename')} ({first.get('ceref')})")
+
+    # --- Test 2: search_indi_details (new) ---
+    print("=" * 60)
+    print("Test: search_indi_details")
+    test_ceref = "BTB840"
+    details = search_indi_details(test_ceref)
+    print(f"  ceref: {details['ceref']}")
+    print(f"  sfoLicences count: {len(details.get('sfoLicences', []))}")
+    print(f"  amloLicences count: {len(details.get('amloLicences', []))}")
+    print(f"  sfoRecords count:   {len(details.get('sfoRecords', []))}")
+    print(f"  amloRecords count:  {len(details.get('amloRecords', []))}")
+
+    # Pretty-print a sample from each
+    if details.get("sfoLicences"):
+        print("\n  Sample sfoLicences:")
+        print(json.dumps(details["sfoLicences"], indent=4, ensure_ascii=False))
+    if details.get("sfoRecords"):
+        print("\n  Sample sfoRecords:")
+        print(json.dumps(details["sfoRecords"], indent=4, ensure_ascii=False))
