@@ -9,7 +9,6 @@ from fastapi import (
     Request, 
     HTTPException, 
     Query, 
-    Response, 
     WebSocket, 
     WebSocketDisconnect,
 )
@@ -94,3 +93,9 @@ async def bql(
         return {"status": "success", "data": data}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Excel Relay internal error: {str(e)}")
+    
+
+@router.get("/xbbg")
+async def test():
+
+    ...

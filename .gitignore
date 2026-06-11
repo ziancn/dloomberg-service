@@ -11,3 +11,7 @@ wheels/
 
 # .env
 .env
+
+# IDEs
+.idea/
+.vscode/
