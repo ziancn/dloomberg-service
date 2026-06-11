@@ -8,6 +8,8 @@ from typing import Any, Literal
 
 import requests
 
+from app.config import settings
+
 logger = logging.getLogger(__name__)
 
 LicStatus = Literal["active", "all"]
@@ -45,6 +47,8 @@ DEFAULT_HEADERS = {
 def _make_session() -> requests.Session:
     session = requests.Session()
     session.headers.update(DEFAULT_HEADERS)
+    if settings.PROXY_URL is not None:
+        session.proxies = {"http": settings.PROXY_URL, "https": settings.PROXY_URL}
     return session
 
 
@@ -312,6 +316,8 @@ def search_licensee(
             s = requests.Session()
             s.cookies.update(session.cookies)
             s.headers.update(session.headers)
+            if settings.PROXY_URL is not None:
+                s.proxies = {"http": settings.PROXY_URL, "https": settings.PROXY_URL}
             r = s.post(
                 api_url,
                 params={"_dc": str(int(time.time() * 1000))},
